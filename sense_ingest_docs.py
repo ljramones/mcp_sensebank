@@ -160,62 +160,6 @@ def _poll_for_tool_result_debug(session: requests.Session, timeout: float) -> Di
     return {"status": "error", "error": f"timeout after {poll_count} polls in {timeout}s"}
 
 
-def debug_single_mcp_call():
-    """Make a single MCP call and show exactly what happens."""
-    logger = logging.getLogger("sense-ingest")
-
-    # Enable debug logging
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(message)s'))
-        logger.addHandler(handler)
-
-    logger.info("=== Starting debug MCP call ===")
-
-    # Get session
-    session = get_mcp_session()
-    logger.info(f"Session ID: {_MCP_SESSION_ID}")
-    logger.info(f"Initialized: {_MCP_INITIALIZED}")
-
-    # Make a simple tool call
-    tool_request = {
-        "jsonrpc": "2.0",
-        "id": "debug-test",
-        "method": "tools/call",
-        "params": {
-            "name": "sense_add",
-            "arguments": {
-                "term": "debug_test",
-                "category": "smell",
-                "locale": "test",
-                "era": "test",
-                "register": "common",
-                "weather": "any",
-                "notes": "debug test"
-            },
-            "sessionId": _MCP_SESSION_ID
-        }
-    }
-
-    logger.info("=== Making POST request ===")
-    response = session.post(MCP_URL, json=tool_request, timeout=10)
-
-    logger.info(f"POST Response: {response.status_code}")
-    logger.info(f"POST Headers: {dict(response.headers)}")
-    logger.info(f"POST Body: {response.text}")
-
-    # If it's 200, try polling
-    if response.status_code == 200:
-        logger.info("=== Starting polling ===")
-        result = _poll_for_tool_result_debug(session, 30.0)
-        logger.info(f"Final result: {result}")
-        return result
-    else:
-        logger.error(f"POST failed with {response.status_code}")
-        return {"status": "error", "error": f"POST failed: {response.status_code}"}
-
-
 def get_mcp_session() -> requests.Session:
     """Get or create a persistent MCP session with initialization."""
     global _MCP_SESSION, _MCP_SESSION_ID, _MCP_INITIALIZED
@@ -304,93 +248,7 @@ def _initialize_mcp_session(session: requests.Session) -> bool:
         logger.error(f"MCP initialization error: {e}")
         return False
 
-def get_persistent_mcp_session() -> requests.Session:
-    """Get or create a persistent MCP session that maintains cookies/state."""
-    global _MCP_SESSION, _MCP_SESSION_ID
 
-    if _MCP_SESSION is None:
-        logger = logging.getLogger("sense-ingest")
-
-        # Create a session that will persist cookies
-        _MCP_SESSION = requests.Session()
-        _MCP_SESSION.headers.update({
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-            "Connection": "keep-alive",
-        })
-
-        # Establish the session with the server
-        try:
-            # Make initial GET to establish session
-            response = _MCP_SESSION.get(MCP_URL, timeout=10)
-            logger.info(f"Session establishment GET: {response.status_code}")
-
-            # The session ID should now be in cookies or headers
-            session_id = None
-
-            # Check headers
-            if 'mcp-session-id' in response.headers:
-                session_id = response.headers['mcp-session-id']
-                logger.info(f"Got session ID from header: {session_id}")
-
-            # Check cookies (they should be automatically stored in the session)
-            for cookie in response.cookies:
-                if 'session' in cookie.name.lower():
-                    session_id = cookie.value
-                    logger.info(f"Got session ID from cookie: {cookie.name} = {cookie.value}")
-                    break
-
-            _MCP_SESSION_ID = session_id
-
-            # Add the session ID to headers for good measure
-            if session_id:
-                _MCP_SESSION.headers['mcp-session-id'] = session_id
-
-        except Exception as e:
-            logger.error(f"Failed to establish persistent session: {e}")
-
-    return _MCP_SESSION
-
-def _ensure_transport_id(s: requests.Session) -> str:
-    """
-    Ensure we always present a stable, client-chosen transport/session id.
-    Many servers require this on the *first* request and won't emit one back.
-    """
-    global _MCP_SESSION_ID
-    if not _MCP_SESSION_ID:
-        _MCP_SESSION_ID = uuid.uuid4().hex  # 32-char hex; server logs look just like this
-
-    # Advertise the id via well-known headers (and a couple alternates)
-    for h in (_MCP_TRANSPORT_HEADER,
-              "X-OpenAI-Transport-Id",
-              "OpenAI-Session-Id",
-              "X-OpenAI-Session-Id",
-              "X-MCP-Session",
-              "X-Session"):
-        if h:
-            s.headers[h] = _MCP_SESSION_ID
-
-    # Mirror into cookies for servers that bind via cookies on GET/poll
-    try:
-        for ck in _MCP_COOKIE_KEYS:
-            s.cookies.set(ck, _MCP_SESSION_ID)
-    except Exception:
-        pass
-
-    return _MCP_SESSION_ID
-
-def url_with_params(url: str, params: Mapping[str, str]) -> str:
-    u = urlparse(url)
-
-    # Build a list[tuple[str, str]] so the str-returning overload is selected.
-    pairs: list[tuple[str, str]] = list(parse_qsl(u.query, keep_blank_values=True))
-    pairs.extend((str(k), str(v)) for k, v in params.items())
-
-    # Explicitly str-returning call
-    query: str = urlencode(pairs, doseq=True, safe="", encoding="utf-8", errors="strict")
-
-    # Use tuple unpacking to ensure proper types
-    return urlunparse((u.scheme, u.netloc, u.path, u.params, query, u.fragment))
 
 def _id_from_any_response(resp: requests.Response) -> Optional[str]:
     # 1) headers: accept any header whose name mentions session/transport/mcp
@@ -421,130 +279,6 @@ def _id_from_any_response(resp: requests.Response) -> Optional[str]:
     except Exception:
         pass
     return None
-
-
-def _poll_for_result(session: requests.Session, timeout: float) -> Dict[str, Any]:
-    """Poll for async MCP operation result."""
-    logger = logging.getLogger("sense-ingest")
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        try:
-            response = session.get(MCP_URL, timeout=2)
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    result = _extract_json_from_batch(data)
-                    if result and result.get("status") not in ("pending", None):
-                        return result
-                except json.JSONDecodeError:
-                    pass
-        except requests.RequestException:
-            pass
-
-        time.sleep(0.05)  # Poll every 50ms
-
-    return {"status": "error", "error": "timeout waiting for MCP result"}
-
-
-def _poll_with_persistent_session(session: requests.Session, timeout: float) -> Dict[str, Any]:
-    """Poll for result using the same persistent session."""
-    logger = logging.getLogger("sense-ingest")
-    deadline = time.time() + timeout
-    poll_count = 0
-
-    while time.time() < deadline:
-        poll_count += 1
-        try:
-            # Poll the same endpoint
-            response = session.get(MCP_URL, timeout=2)
-            logger.debug(f"Poll {poll_count}: {response.status_code}")
-
-            if response.status_code == 200:
-                content_type = response.headers.get('content-type', '')
-
-                # Try JSON first
-                if 'application/json' in content_type:
-                    try:
-                        data = response.json()
-                        result = _extract_json_from_batch(data)
-                        if result and result.get("status") not in ("pending", None):
-                            logger.debug(f"Got result after {poll_count} polls")
-                            return result
-                    except json.JSONDecodeError:
-                        pass
-
-                # Try SSE format
-                elif 'text/event-stream' in content_type or 'data:' in response.text:
-                    try:
-                        result = _parse_sse_response(response.text)
-                        if result and result.get("status") not in ("pending", "error", None):
-                            logger.debug(f"Got SSE result after {poll_count} polls")
-                            return result
-                    except Exception as e:
-                        logger.debug(f"SSE parse error: {e}")
-
-                # Log response for debugging if we can't parse it
-                if poll_count <= 3:  # Only log first few attempts
-                    logger.debug(f"Poll response: {response.text[:200]}")
-
-        except requests.RequestException as e:
-            logger.debug(f"Poll {poll_count} failed: {e}")
-
-        time.sleep(0.1)  # Poll every 100ms
-
-    return {"status": "error", "error": f"timeout after {poll_count} polls"}
-
-
-def _parse_sse_response(sse_text: str) -> Dict[str, Any]:
-    """Parse Server-Sent Events response format."""
-    lines = sse_text.strip().split('\n')
-
-    for line in lines:
-        line = line.strip()
-        if line.startswith('data: '):
-            data_content = line[6:]  # Remove 'data: ' prefix
-            if data_content and data_content not in ['[DONE]', '']:
-                try:
-                    data = json.loads(data_content)
-                    result = _extract_json_from_batch(data)
-                    if result:
-                        return result
-                except json.JSONDecodeError:
-                    continue
-
-    return {"status": "pending"}  # No complete result yet
-
-def reset_mcp_session():
-    """Reset MCP session state."""
-    global _MCP_SESSION, _MCP_SESSION_ID, _MCP_INITIALIZED
-    if _MCP_SESSION:
-        _MCP_SESSION.close()
-    _MCP_SESSION = None
-    _MCP_SESSION_ID = None
-    _MCP_INITIALIZED = False
-
-
-# Test function
-def test_persistent_session():
-    """Test the persistent session approach."""
-    logger = logging.getLogger("sense-ingest")
-    logger.setLevel(logging.INFO)
-
-    # Test multiple calls with the same session
-    for i in range(3):
-        result = mcp_call("sense_add", {
-            "term": f"test{i}",
-            "category": "smell",
-            "locale": "test",
-            "era": "test",
-            "register": "common",
-            "weather": "any",
-            "notes": f"test item {i}"
-        })
-        print(f"Call {i}: {result}")
-        time.sleep(0.1)  # Small delay between calls
-
 
 def mcp_call(tool_name: str, arguments: Dict[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
     """
@@ -662,75 +396,6 @@ def _parse_immediate_sse_response(sse_text: str) -> Dict[str, Any]:
     # Couldn't parse anything useful
     return {"status": "error", "error": "Could not parse SSE response"}
 
-
-# Test this fix
-def test_immediate_sse():
-    """Test the immediate SSE parsing with your actual server response."""
-    # Your actual server response from the debug:
-    test_response = '''event: message
-data: {"jsonrpc":"2.0","id":"debug-test","result":{"content":[{"type":"text","text":"{\n  \"type\": \"json\",\n  \"json\": {\n    \"status\": \"added\",\n    \"file\": \"/Users/larrymitchell/ML/writer-agents/sense-bank-starter/data/test_sensory.csv\",\n    \"record\": {\n      \"term\": \"debug_test\",\n      \"category\": \"smell\",\n      \"locale\": \"test\",\n      \"era\": \"test\",\n      \"weather\": \"any\",\n      \"register\": \"common\",\n      \"notes\": \"debug test\"\n    },\n    \"created_file\": false\n  }\n}"}],"structuredContent":{"result":{"type":"json","json":{"status":"added","file":"/Users/larrymitchell/ML/writer-agents/sense-bank-starter/data/test_sensory.csv","record":{"term":"debug_test","category":"smell","locale":"test","era":"test","weather":"any","register":"common","notes":"debug test"},"created_file":false}}},"isError":false}}'''
-
-    result = _parse_immediate_sse_response(test_response)
-    print(f"Parsed result: {result}")
-    return result
-
-def _poll_for_tool_result(session: requests.Session, timeout: float) -> Dict[str, Any]:
-    """Poll for tool result with better timing and more attempts."""
-    logger = logging.getLogger("sense-ingest")
-    deadline = time.time() + timeout
-    poll_count = 0
-    last_response_text = ""
-
-    # Start with faster polling, then slow down
-    poll_intervals = [0.05, 0.05, 0.1, 0.1, 0.2, 0.2, 0.5, 0.5, 1.0]
-
-    while time.time() < deadline:
-        poll_count += 1
-
-        # Use progressive polling intervals
-        interval = poll_intervals[min(poll_count - 1, len(poll_intervals) - 1)]
-
-        try:
-            response = session.get(MCP_URL, timeout=5)  # Increased timeout
-
-            if response.status_code == 200:
-                response_text = response.text[:500]  # First 500 chars for comparison
-
-                # Only process if response changed (indicates new data)
-                if response_text != last_response_text:
-                    logger.debug(f"Poll {poll_count}: New response received")
-                    last_response_text = response_text
-
-                    try:
-                        data = response.json()
-                        result = _extract_tool_result(data)
-                        if result and result.get("status") not in ("pending", None):
-                            logger.info(
-                                f"Got result after {poll_count} polls in {time.time() - (deadline - timeout):.1f}s")
-                            return result
-                    except json.JSONDecodeError:
-                        # Try SSE format
-                        if 'data:' in response.text:
-                            result = _parse_sse_for_tool_result(response.text)
-                            if result and result.get("status") not in ("pending", None):
-                                logger.info(f"Got SSE result after {poll_count} polls")
-                                return result
-                else:
-                    logger.debug(f"Poll {poll_count}: No new data")
-
-                # Log sample response for first few polls
-                if poll_count <= 3:
-                    logger.debug(f"Poll {poll_count} response sample: {response.text[:100]}")
-
-        except requests.RequestException as e:
-            logger.debug(f"Poll {poll_count} failed: {e}")
-
-        # Wait before next poll
-        time.sleep(interval)
-
-    return {"status": "error", "error": f"timeout after {poll_count} polls in {timeout}s"}
-
-
 def _extract_tool_result(data: Any) -> Optional[Dict[str, Any]]:
     """Extract tool result from MCP response."""
     if isinstance(data, dict):
@@ -791,69 +456,6 @@ def _parse_sse_for_tool_result(sse_text: str) -> Optional[Dict[str, Any]]:
 
     return {"status": "pending"}
 
-# Test the initialization
-def test_mcp_initialization():
-    """Test MCP initialization and a simple tool call."""
-    logger = logging.getLogger("sense-ingest")
-    logger.setLevel(logging.INFO)
-
-    # Create handler if none exists
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(message)s'))
-        logger.addHandler(handler)
-
-    print("Testing MCP initialization...")
-
-    # Test initialization
-    session = get_mcp_session()
-    print(f"Session initialized: {_MCP_INITIALIZED}")
-    print(f"Session ID: {_MCP_SESSION_ID}")
-
-    # Test a tool call
-    if _MCP_INITIALIZED:
-        print("Testing tool call...")
-        result = mcp_call("sense_add", {
-            "term": "test_init",
-            "category": "smell",
-            "locale": "test",
-            "era": "test",
-            "register": "common",
-            "weather": "any",
-            "notes": "initialization test"
-        })
-        print(f"Tool call result: {result}")
-
-    return _MCP_INITIALIZED
-
-
-if __name__ == "__main__":
-    # Set your MCP_URL here
-    MCP_URL = "http://127.0.0.1:8000/mcp"
-    test_mcp_initialization()
-
-def _poll_for_result_with_session(session: requests.Session, timeout: float) -> Dict[str, Any]:
-    """Poll for result using the same session."""
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        try:
-            response = session.get(MCP_URL, timeout=2)
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    result = _extract_json_from_batch(data)
-                    if result and result.get("status") not in ("pending", None):
-                        return result
-                except json.JSONDecodeError:
-                    pass
-        except requests.RequestException:
-            pass
-
-        time.sleep(0.05)
-
-    return {"status": "error", "error": "timeout waiting for result"}
-
 
 def _establish_session_properly(session: requests.Session) -> Optional[str]:
     """Establish session by getting the server-generated session ID."""
@@ -901,21 +503,6 @@ def _establish_session_properly(session: requests.Session) -> Optional[str]:
 
     return None
 
-def _mcp_session() -> requests.Session:
-    """Singleton HTTP session with proper session establishment."""
-    global _MCP_SES
-    if _MCP_SES is None:
-        s = requests.Session()
-        s.headers.update({
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-            "Connection": "keep-alive",
-        })
-        _MCP_SES = s
-        # Establish session by making a GET request first
-        _establish_session_properly(s)
-    return _MCP_SES
-
 def _apply_session(s: requests.Session, sid: str) -> None:
     """Broadcast the server-issued id via headers and cookies for subsequent calls."""
     global _MCP_SESSION_ID
@@ -928,119 +515,6 @@ def _apply_session(s: requests.Session, sid: str) -> None:
             s.cookies.set(ck, sid)
     except Exception:
         pass
-
-def _harvest_sid_from_response_and_jar(s: requests.Session, resp: requests.Response) -> Optional[str]:
-    """Extract a transport/session id from response headers, Set-Cookie, or the session cookie jar."""
-    # 1) Direct headers (look for *any* header name containing session/transport)
-    for k, v in resp.headers.items():
-        name = (k or "").lower()
-        if any(t in name for t in ("session", "transport", "mcp")):
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-
-    # 2) Raw Set-Cookie header (parse manually, some setups don’t populate resp.cookies)
-    try:
-        sc = resp.headers.get("Set-Cookie") or resp.headers.get("set-cookie")
-        if sc:
-            from http.cookies import SimpleCookie
-            c = SimpleCookie()
-            c.load(sc)
-            for morsel in c.values():
-                n = (morsel.key or "").lower()
-                if any(t in n for t in ("session", "transport", "mcp")) and morsel.value:
-                    return morsel.value
-    except Exception:
-        pass
-
-    # 3) Response cookie jar (if present)
-    try:
-        for c in getattr(resp, "cookies", []):
-            n = (getattr(c, "name", "") or "").lower()
-            val = getattr(c, "value", "") or ""
-            if val and any(t in n for t in ("session", "transport", "mcp")):
-                return str(val)
-    except Exception:
-        pass
-
-    # 4) Session-wide cookie jar (IMPORTANT: don’t use `if name in jar` — iterate!)
-    try:
-        jar = s.cookies
-        # iterate all cookies
-        for c in jar:
-            n = (getattr(c, "name", "") or "").lower()
-            val = getattr(c, "value", "") or ""
-            if val and any(t in n for t in ("session", "transport", "mcp")):
-                return str(val)
-        # also try direct gets without membership test
-        for k in _MCP_COOKIE_KEYS:
-            val = jar.get(k)  # NOTE: no prior `if k in jar`
-            if val:
-                return str(val)
-    except Exception:
-        pass
-
-    # 5) (Rare) JSON body
-    try:
-        j = resp.json()
-        if isinstance(j, dict):
-            res = j.get("result") or {}
-            for key in ("sessionId", "transportId", "session", "id"):
-                vv = res.get(key) or j.get(key)
-                if vv:
-                    return str(vv).strip()
-    except Exception:
-        pass
-
-    return None
-
-
-
-def _ensure_mcp_session(s: requests.Session) -> Optional[str]:
-    """
-    Obtain a server-issued session id by touching /mcp and harvesting headers/cookies.
-    No synthetic ids here.
-    """
-    global _MCP_SESSION_ID
-    if _MCP_SESSION_ID:
-        _apply_session(s, _MCP_SESSION_ID)
-        return _MCP_SESSION_ID
-
-    # Touch /mcp (server logs show it creates a transport on contact)
-    try:
-        r = s.get(MCP_URL, allow_redirects=True, timeout=5)
-        sid = _id_from_any_response(r)
-        if sid:
-            _apply_session(s, sid)
-            return sid
-    except Exception:
-        pass
-
-    # One more light probe that sometimes sets cookies/headers
-    for u in (MCP_URL + "/", MCP_URL + "/session", MCP_URL + "/init"):
-        try:
-            r = s.get(u, allow_redirects=True, timeout=5)
-            sid = _id_from_any_response(r)
-            if sid:
-                _apply_session(s, sid)
-                return sid
-        except Exception:
-            continue
-
-    return None
-
-
-
-
-def _get_mcp_client() -> "MCPClient":
-    """Create or return a process-wide MCP client."""
-    global _MCP_CLIENT
-    if _MCP_CLIENT is None:
-        with _MCP_LOCK:
-            if _MCP_CLIENT is None:
-                client = MCPClient(lambda: streamablehttp_client(MCP_URL))
-                _MCP_STACK.enter_context(cast(ContextManager, client))  # tell type-checker it's a CM
-                _MCP_CLIENT = client
-    return _MCP_CLIENT
 
 
 def _close_mcp_client():
@@ -1056,116 +530,11 @@ def _close_mcp_client():
 
 atexit.register(_close_mcp_client)
 
-def _extract_json_from_batch(batch: Any) -> Optional[Dict[str, Any]]:
-    """
-    Try several shapes:
-    - list of envelopes with {"content":[{"type":"json","json":{...}}]}
-    - list with {"result":{"content":[...]}}
-    - text part holding JSON
-    - direct dict already
-    """
-    try:
-        if isinstance(batch, dict):
-            # Sometimes a single envelope
-            candidates = [batch]
-        elif isinstance(batch, list):
-            candidates = batch
-        else:
-            return None
 
-        for env in candidates:
-            # 1) direct typed content
-            content = (
-                env.get("content")
-                or (env.get("result") or {}).get("content")
-                or []
-            )
-            if isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict):
-                        if c.get("type") == "json" and isinstance(c.get("json"), dict):
-                            return c["json"]
-                        if c.get("type") == "text":
-                            txt = c.get("text", "")
-                            try:
-                                return json.loads(txt)
-                            except Exception:
-                                pass
-            # 2) already a dict payload (some adapters do this)
-            if env.get("status") in ("ok", "added", "exists", "error") or "status" in env:
-                return env
-    except Exception:
-        return None
-    return None
-
-def _tool_result_to_obj(res) -> dict:
-    """
-    Normalize an MCP tool result to a dict.
-    Supports:
-      - res.structuredContent / res.structured_content (dict or list[dict])
-      - res.content: items with .json / .data / .object / .text
-      - dict-shaped content items (same keys as above)
-      - fallback: try model_dump() or return {"status":"ok","raw_text":...}
-    """
-    # 1) structured content variants
-    sc = getattr(res, "structuredContent", None) or getattr(res, "structured_content", None)
-    if sc:
-        if isinstance(sc, dict):
-            return sc
-        if isinstance(sc, list) and sc and isinstance(sc[0], dict):
-            return sc[0]
-
-    # 2) content list
-    contents = (getattr(res, "content", None) or getattr(res, "contents", None)) or []
-    if contents:
-        # a) JSON-like payloads first
-        for c in contents:
-            if isinstance(c, dict):
-                for k in ("json", "data", "object", "value"):
-                    v = c.get(k)
-                    if isinstance(v, dict):
-                        return v
-            else:
-                for k in ("json", "data", "object", "value"):
-                    v = getattr(c, k, None)
-                    if isinstance(v, dict):
-                        return v
-
-        # b) Try to parse text as JSON
-        texts = []
-        for c in contents:
-            t = (c.get("text") if isinstance(c, dict) else getattr(c, "text", None))
-            if isinstance(t, str) and t.strip():
-                texts.append(t)
-                try:
-                    return json.loads(t)
-                except Exception:
-                    pass
-
-        # c) If we have text but it’s not JSON, return it for debugging
-        if texts:
-            joined = "\n".join(texts)
-            return {"status": "ok", "raw_text": joined}
-
-    # 3) Some clients expose model_dump()
-    try:
-        md = getattr(res, "model_dump", None)
-        if callable(md):
-            d = md()
-            if isinstance(d, dict):
-                return d
-    except Exception:
-        pass
-
-    # 4) Last resort: reflect some shape
-    return {"status": "error", "error": "empty MCP result"}  # always a dict
 
 def _default_file_for_locale(locale: str) -> str:
     key = (locale or "misc").strip()
     return DEFAULT_FILES.get(key, f"{key.lower().replace(' ', '_')}_sensory.csv")
-
-def _choose_csv_for_locale(locale: str) -> Path:
-    return DATA_DIR / _default_file_for_locale(locale)
 
 
 def _csv_load_rows(path: Path) -> list[dict]:
@@ -1247,8 +616,6 @@ def load_state() -> Dict:
 def save_state(st: Dict):
     STATE_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def slug(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", (s or "").strip().lower()).strip("_")
 
 # ------------------ PDF text extraction ------------------
 def pdf_to_texts(pdf_path: Path, ocr: bool = True, ocr_lang: str = "eng") -> List[str]:
@@ -1800,19 +1167,6 @@ def sense_add(record: Dict) -> Dict:
     log.error("sense_add failed after %d attempts: term=%r → %s",
               retries + 1, record.get("term"), json.dumps(last, ensure_ascii=False)[:200])
     return last
-
-
-# ------------------ chunking ------------------
-def chunk_paragraphs(text: str, max_chars: int = 4000) -> List[str]:
-    pars = re.split(r"\n\s*\n", text.strip())
-    out, cur = [], ""
-    for p in pars:
-        if len(cur) + len(p) + 2 > max_chars and cur:
-            out.append(cur.strip()); cur = p
-        else:
-            cur = (cur + "\n\n" + p) if cur else p
-    if cur.strip(): out.append(cur.strip())
-    return out
 
 # ------------------ sidecar (.yml) ------------------
 def sidecar_for(pdf: Path) -> Optional[Path]:
