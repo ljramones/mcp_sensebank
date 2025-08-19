@@ -341,8 +341,8 @@ sense_ingest_docs/
 
 ## License
 
-[Specify your license here]
+Apache Source License V2
 
 ## Contributing
 
-[Specify contribution guidelines here]
+Send me a note at  if you'd like to contribute!
