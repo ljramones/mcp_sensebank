@@ -1,0 +1,36 @@
+# Regex lists; first match wins per section.
+locales:
+  Japan:
+    - "\\bHeian|Kyoto|Nara|Yamato\\b"
+    - "\\bGenji\\b"
+  "Abbasid Baghdad":
+    - "\\bBaghdad\\b"
+  Venice:
+    - "\\bVenice|Venezia|lagoon\\b"
+
+eras:
+  Heian:
+    - "\\bHeian\\b"
+    - "\\b(79[4-9]|8\\d\\d|11[0-7]\\d)\\b"  # 794–1179 (loose)
+  Song:
+    - "\\bSong\\b"
+  Mughal:
+    - "\\bMughal\\b"
+  "High Medieval":
+    - "\\b(11\\d\\d|12\\d\\d)\\b"
+
+registers:
+  court: ["\\bcourt\\b", "\\bpalace\\b"]
+  common: ["\\bmarket|street\\b"]
+  scholar: ["\\bscroll|inkstone|scriptorium|study\\b"]
+  maritime: ["\\brope|tar|rigging|quay|dock\\b"]
+  festival: ["\\bfestival|holi|drum\\b"]
+  monastic: ["\\bmonk|abbey|temple\\b"]
+
+weather:
+  rain: ["\\brain|storm|eaves\\b"]
+  monsoon: ["\\bmonsoon\\b"]
+  "dry season": ["\\bdry season\\b"]
+  "winter snow": ["\\bsnow\\b"]
+  dawn: ["\\bdawn\\b"]
+  night: ["\\bnight\\b"]
