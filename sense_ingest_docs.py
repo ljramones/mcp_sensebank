@@ -2,7 +2,6 @@
 import csv
 import sys, hashlib, re
 from pathlib import Path
-from typing import  Mapping
 import yaml
 import shutil
 from datetime import datetime
@@ -10,13 +9,11 @@ from collections import Counter
 from contextlib import contextmanager
 
 from strands.tools.mcp.mcp_client import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
 
 import os, json, time, uuid, logging, atexit, requests
-from typing import Any, Optional, ContextManager, cast
+from typing import Any, Optional
 from contextlib import ExitStack
 import threading
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from typing import Dict, List, Tuple
 
 
@@ -31,16 +28,8 @@ DEFAULT_REGISTER = "common"
 DEFAULT_WEATHER  = "any"
 
 ALLOWED_CATS = {"smell","sound","taste","touch","sight"}
-BAN_TERMS = {"fear","sorrow","disgust","horrific","light","darkness","smile","eyes","face","location","sound","sight","taste"}  # tune
-MIN_TERM_CHARS = 4
+MIN_TERM_CHARS = 6  # Increased for better quality
 
-SENSORY_HINTS = {
-  "smell": {"scent","odor","aroma","acrid","resin","smoke","incense","camphor","must","rank"},
-  "sound": {"clang","ring","murmur","whinny","shriek","rumble","drone","hiss","chime","thud"},
-  "taste": {"bitter","sweet","coppery","salty","sour","umami","astringent"},
-  "touch": {"warmth","chill","clammy","grit","greasy","oily","rough","silken"},
-  "sight": {"glare","glint","sheen","milky","ashen","verdigris","sooty","saffron"},
-}
 
 # Where the Sense-Bank CSVs live (override via flag or env)
 DATA_DIR = Path(os.getenv("SENSEBANK_DATA_DIR", Path(__file__).parent / "data"))
@@ -57,6 +46,328 @@ DEFAULT_FILES = {
     "Abbasid Baghdad": "baghdad_sensory.csv",
     # add more as you like…
 }
+
+# Final optimized prompts for high-quality sensory extraction
+
+SYSTEM_FINAL = """You are a specialist in extracting PHYSICAL SENSORY EXPERIENCES from historical texts.
+
+EXTRACT ONLY these 5 types:
+1. SMELL: Scents/odors - "acrid smoke", "sweet incense", "putrid decay", "fragrant blossoms"
+2. SOUND: Audio qualities - "thunderous roar", "soft whisper", "piercing shriek", "distant chiming"  
+3. TASTE: Flavors in mouth - "bitter medicine", "sweet honey", "metallic blood", "salty tears"
+4. TOUCH: Physical sensations - "rough bark", "silky cloth", "burning heat", "icy wind"
+5. SIGHT: Visual qualities - "blazing fire", "dim shadows", "brilliant gold", "shimmering water"
+
+NEVER extract:
+❌ Emotions: "angry look", "confident air", "nervous glance"
+❌ Body parts: "eyes", "face", "hands", "mouth"  
+❌ Actions: "breathing", "heartbeat", "running", "walking"
+❌ Objects without qualities: "sword", "tea", "house", "door"
+
+QUALITY RULES:
+• Each term must describe HOW something affects the senses
+• Use specific sensory vocabulary (acrid, thunderous, silky, blazing, putrid)
+• 2-3 words maximum per term
+• Only extract 3-5 terms per passage (be highly selective)
+
+Return: {"items":[{"term":"Acrid Smoke","category":"smell","notes":"brief context"}]}"""
+
+USER_TEMPLATE_FINAL = """Extract ONLY genuine sensory experiences that characters physically perceive through their 5 senses.
+
+SETTING: {locale}, {era} period, {register} context, {weather} conditions
+
+FOCUS ON:
+• What characters SMELL (scents, odors, aromas)
+• What they HEAR (sound qualities, not just "voice" or "sound")  
+• What they TASTE (actual flavors in mouth)
+• What they FEEL physically (textures, temperatures, pressures)
+• What they SEE (visual qualities, not just objects)
+
+PASSAGE:
+{passage}
+
+Extract 3-5 high-quality sensory terms with specific descriptive vocabulary."""
+
+# Enhanced category-specific validation requirements
+def get_category_requirements():
+    """Return strict requirements for each sensory category."""
+    return {
+        "smell": {
+            "required_words": ["acrid", "putrid", "sweet", "fragrant", "musty", "smoky", "fresh", "stale", "pungent", "aromatic"],
+            "required_concepts": ["scent", "odor", "aroma", "stench", "fragrance", "smell", "reek"],
+            "description": "Must contain scent/odor vocabulary"
+        },
+        "sound": {
+            "required_words": ["thunderous", "piercing", "soft", "loud", "harsh", "melodic", "distant", "muffled", "sharp", "resonant"],
+            "required_concepts": ["roar", "whisper", "scream", "crash", "chime", "rumble", "echo", "clang", "rustle"],
+            "description": "Must contain audio quality descriptors"
+        },
+        "taste": {
+            "required_words": ["bitter", "sweet", "sour", "salty", "savory", "metallic", "coppery", "sharp", "mild", "rich"],
+            "required_concepts": ["taste", "flavor", "aftertaste"],
+            "description": "Must contain taste/flavor vocabulary"
+        },
+        "touch": {
+            "required_words": ["rough", "smooth", "soft", "hard", "hot", "cold", "warm", "cool", "silky", "coarse"],
+            "required_concepts": ["texture", "temperature", "pressure", "sensation"],
+            "description": "Must contain physical sensation vocabulary"
+        },
+        "sight": {
+            "required_words": ["blazing", "dim", "bright", "brilliant", "pale", "vivid", "gleaming", "shimmering", "glowing", "sparkling"],
+            "required_concepts": ["light", "glow", "shine", "reflection", "color intensity"],
+            "description": "Must contain visual quality descriptors"
+        }
+    }
+
+# Complete specialized sensory categories for historical research
+
+# Enhanced 5-category system with subcategories for detailed analysis
+ENHANCED_CATEGORIES = {
+    "smell": {
+        "subcategories": ["incense", "cooking", "nature", "decay", "perfume", "smoke", "medicine"],
+        "priority_terms": ["acrid smoke", "sweet incense", "putrid decay", "aromatic spices", "medicinal herbs"],
+        "historical_focus": ["temple incense", "cooking fires", "herbal remedies", "ceremonial perfumes"]
+    },
+    "sound": {
+        "subcategories": ["music", "combat", "nature", "crowd", "mechanical", "voice_quality", "ceremonial"],
+        "priority_terms": ["thunderous drums", "clashing steel", "whispered prayers", "distant bells", "rustling silk"],
+        "historical_focus": ["temple bells", "battle cries", "court music", "merchant calls"]
+    },
+    "taste": {
+        "subcategories": ["food", "drink", "medicine", "ceremonial", "bodily", "spices"],
+        "priority_terms": ["bitter tea", "sweet wine", "metallic blood", "savory broth", "pungent spices"],
+        "historical_focus": ["ritual wines", "medicinal teas", "exotic spices", "ceremonial foods"]
+    },
+    "touch": {
+        "subcategories": ["fabric", "temperature", "texture", "pressure", "pain", "weather"],
+        "priority_terms": ["silken robes", "burning fever", "rough stone", "gentle breeze", "icy wind"],
+        "historical_focus": ["luxury textiles", "architectural materials", "weather sensations", "ceremonial objects"]
+    },
+    "sight": {
+        "subcategories": ["light", "color", "movement", "scale", "clarity", "architecture"],
+        "priority_terms": ["blazing torches", "shimmering silk", "towering pagodas", "misty dawn", "golden ornaments"],
+        "historical_focus": ["architectural grandeur", "textile colors", "lighting effects", "natural phenomena"]
+    }
+}
+
+# Alternative: Historically-focused 7-category system for more nuanced analysis
+HISTORICAL_CATEGORIES = {
+    "scent": {
+        "description": "Aromatic experiences - incense, cooking, nature, decay",
+        "vocabulary": ["aromatic", "putrid", "smoky", "floral", "musty", "pungent", "fragrant", "acrid"],
+        "examples": ["burning incense", "aromatic spices", "putrid decay", "smoky braziers"]
+    },
+    "audio": {
+        "description": "Sound qualities and acoustic experiences",
+        "vocabulary": ["thunderous", "melodic", "harsh", "distant", "resonant", "piercing", "muffled", "echoing"],
+        "examples": ["thunderous drums", "melodic chanting", "distant bells", "harsh gongs"]
+    },
+    "flavor": {
+        "description": "Taste experiences in mouth",
+        "vocabulary": ["bitter", "sweet", "metallic", "savory", "sharp", "sour", "salty", "astringent"],
+        "examples": ["bitter medicine", "sweet honey", "metallic blood", "sharp wine"]
+    },
+    "texture": {
+        "description": "Physical surface qualities and tactile sensations",
+        "vocabulary": ["silken", "rough", "smooth", "coarse", "soft", "hard", "polished", "worn"],
+        "examples": ["silken robes", "rough stone", "polished jade", "worn leather"]
+    },
+    "temperature": {
+        "description": "Thermal sensations and temperature-related experiences",
+        "vocabulary": ["blazing", "icy", "warm", "cool", "burning", "freezing", "scorching", "chilled"],
+        "examples": ["blazing hearth", "icy wind", "warm embers", "scorching sand"]
+    },
+    "luminosity": {
+        "description": "Light qualities, brightness, and visual illumination",
+        "vocabulary": ["brilliant", "dim", "glowing", "shadowy", "radiant", "flickering", "gleaming", "lustrous"],
+        "examples": ["brilliant sunlight", "flickering candles", "gleaming bronze", "shadowy corners"]
+    },
+    "atmosphere": {
+        "description": "Environmental and spatial sensory qualities",
+        "vocabulary": ["oppressive", "ethereal", "heavy", "light", "dense", "airy", "stifling", "refreshing"],
+        "examples": ["oppressive heat", "ethereal mist", "heavy incense", "refreshing breeze"]
+    }
+}
+
+# Context-aware vocabulary for different historical settings
+REGISTER_SPECIFIC_VOCABULARY = {
+    "court": {
+        "scent": ["perfumed oils", "aromatic incense", "exotic fragrances", "sandalwood", "precious aromatics"],
+        "audio": ["ceremonial bells", "hushed whispers", "formal announcements", "silk rustling", "jade chimes"],
+        "flavor": ["exotic delicacies", "aged wines", "honeyed treats", "rare spices", "imperial teas"],
+        "texture": ["silk brocade", "polished jade", "smooth lacquer", "soft furs", "precious metals"],
+        "temperature": ["warm pavilions", "cool marble", "heated chambers"],
+        "luminosity": ["golden glow", "pearl luminescence", "jeweled brilliance", "lantern light"],
+        "atmosphere": ["formal grandeur", "hushed reverence", "luxurious comfort"]
+    },
+    "market": {
+        "scent": ["cooking spices", "fresh produce", "smoky braziers", "animal odors", "dusty goods"],
+        "audio": ["haggling voices", "clattering coins", "creaking carts", "animal sounds", "vendor calls"],
+        "flavor": ["street food", "fresh fruits", "coarse bread", "simple wines", "common teas"],
+        "texture": ["rough hemp", "worn leather", "coarse fabric", "wooden goods", "metal tools"],
+        "temperature": ["dusty heat", "cool shade", "warm crowds"],
+        "luminosity": ["flickering lanterns", "dusty sunbeams", "shadowy stalls", "bright daylight"],
+        "atmosphere": ["bustling energy", "crowded chaos", "commercial bustle"]
+    },
+    "monastic": {
+        "scent": ["burning incense", "medicinal herbs", "aged wood", "paper scrolls", "stone dampness"],
+        "audio": ["chanted prayers", "temple bells", "rustling robes", "turning pages", "meditation silence"],
+        "flavor": ["simple teas", "medicinal broths", "plain rice", "herbal remedies"],
+        "texture": ["worn stone", "smooth prayer beads", "rough hemp robes", "soft paper", "cold metal"],
+        "temperature": ["cool halls", "warm meditation rooms", "chilled mornings"],
+        "luminosity": ["candlelight", "dawn glow", "sacred flames", "filtered sunlight"],
+        "atmosphere": ["sacred silence", "contemplative peace", "spiritual weight"]
+    },
+    "military": {
+        "scent": ["weapon oil", "leather armor", "campfire smoke", "horse sweat", "blood"],
+        "audio": ["clashing weapons", "shouted commands", "marching feet", "armor clanking", "battle cries"],
+        "flavor": ["soldier rations", "strong wine", "metallic taste", "dried meat"],
+        "texture": ["rough armor", "sharp blades", "coarse rope", "hard ground", "leather straps"],
+        "temperature": ["cold steel", "heated battles", "campfire warmth"],
+        "luminosity": ["gleaming weapons", "flickering campfires", "dawn light", "torch flames"],
+        "atmosphere": ["tense alertness", "disciplined order", "battle fury"]
+    },
+    "festival": {
+        "scent": ["festive foods", "flower garlands", "burning offerings", "crowd odors", "celebratory incense"],
+        "audio": ["joyful music", "crowd cheers", "festival drums", "laughter", "ceremonial songs"],
+        "flavor": ["festive delicacies", "sweet treats", "celebratory wines", "special foods"],
+        "texture": ["colorful fabrics", "smooth decorations", "soft flowers", "polished ornaments"],
+        "temperature": ["warm celebrations", "cool evening air", "heated crowds"],
+        "luminosity": ["bright lanterns", "colorful displays", "festive lights", "fireworks"],
+        "atmosphere": ["joyful celebration", "festive energy", "communal excitement"]
+    },
+    "garden": {
+        "scent": ["blooming flowers", "fresh earth", "pond water", "growing plants", "morning dew"],
+        "audio": ["rustling leaves", "flowing water", "bird songs", "gentle breezes", "insect buzzing"],
+        "flavor": ["fresh fruits", "flower nectar", "herb flavors", "clean water"],
+        "texture": ["smooth stones", "soft moss", "rough bark", "flowing water", "delicate petals"],
+        "temperature": ["cool shade", "warm sunshine", "gentle breezes", "cool water"],
+        "luminosity": ["dappled sunlight", "morning glow", "reflecting water", "flower colors"],
+        "atmosphere": ["peaceful tranquility", "natural harmony", "serene beauty"]
+    },
+    "maritime": {
+        "scent": ["salt air", "tar rope", "fish odors", "wet wood", "ocean spray"],
+        "audio": ["creaking wood", "lapping waves", "wind in sails", "rope sounds", "seabird calls"],
+        "flavor": ["salty spray", "preserved fish", "ship rations", "brackish water"],
+        "texture": ["rough rope", "wet wood", "salt-crusted surfaces", "rolling deck", "cold water"],
+        "temperature": ["ocean winds", "sun-heated deck", "cold spray", "humid air"],
+        "luminosity": ["sun on water", "misty horizons", "lantern light", "starlit nights"],
+        "atmosphere": ["open vastness", "maritime rhythm", "oceanic power"]
+    }
+}
+
+# Era-specific sensory preferences for different historical periods
+ERA_SPECIFIC_FOCUS = {
+    "Song": {
+        "priority_categories": ["scent", "flavor", "texture", "luminosity"],
+        "cultural_emphasis": ["tea culture", "silk textiles", "porcelain", "scholarly pursuits"],
+        "common_sensory_experiences": ["tea ceremonies", "silk clothing", "ink and paper", "garden aesthetics"]
+    },
+    "Heian": {
+        "priority_categories": ["scent", "texture", "atmosphere", "luminosity"],
+        "cultural_emphasis": ["court refinement", "seasonal awareness", "textile aesthetics", "incense culture"],
+        "common_sensory_experiences": ["incense blending", "silk layering", "moon viewing", "poetry composition"]
+    },
+    "Mughal": {
+        "priority_categories": ["scent", "flavor", "luminosity", "texture"],
+        "cultural_emphasis": ["architectural grandeur", "garden culture", "textile luxury", "culinary sophistication"],
+        "common_sensory_experiences": ["garden pavilions", "marble architecture", "spiced cuisine", "jeweled decoration"]
+    },
+    "Chimú": {
+        "priority_categories": ["texture", "luminosity", "scent", "temperature"],
+        "cultural_emphasis": ["metallurgy", "textile arts", "maritime culture", "desert environment"],
+        "common_sensory_experiences": ["metal working", "cotton textiles", "ocean proximity", "desert conditions"]
+    }
+}
+
+
+
+# ---- improved extraction constants  ----
+
+# Updated ban terms - comprehensive filtering
+BAN_TERMS = {
+    # Body parts
+    "face", "eyes", "eye", "hand", "hands", "arm", "arms", "body", "head", "neck", "chest", "mouth", "lips", "nose",
+    # Senses themselves
+    "sight", "sound", "taste", "touch", "smell", "hearing", "vision",
+    # Emotions (not sensory)
+    "fear", "anger", "joy", "sadness", "disgust", "surprise", "calm", "panic", "hatred", "love",
+    # Generic objects
+    "voice", "expression", "package", "window", "doll", "jar", "bucket", "water",
+    # Lighting terms (too generic)
+    "light", "darkness", "bright", "dark",
+    # Movement/actions
+    "motion", "movement", "grabbing", "running", "walking",
+    # Generic descriptors
+    "people", "person", "man", "woman", "child", "children"
+}
+
+# Enhanced sensory hints with more specific terms
+SENSORY_HINTS = {
+    "smell": {
+        "scent", "odor", "aroma", "fragrance", "perfume", "incense", "musk", "stench", "reek",
+        "acrid", "pungent", "sweet", "floral", "earthy", "smoky", "spicy", "rancid", "fresh"
+    },
+    "sound": {
+        "clang", "ring", "murmur", "whisper", "roar", "shriek", "wail", "chime", "thud", "crash",
+        "rustle", "crackle", "hiss", "buzz", "drone", "echo", "rumble", "clatter", "screech"
+    },
+    "taste": {
+        "bitter", "sweet", "sour", "salty", "umami", "savory", "tart", "tangy", "bland", "spicy",
+        "coppery", "metallic", "astringent", "creamy", "rich", "sharp"
+    },
+    "touch": {
+        "rough", "smooth", "soft", "hard", "cold", "warm", "hot", "cool", "wet", "dry",
+        "sticky", "slippery", "gritty", "silky", "coarse", "tender", "firm", "elastic"
+    },
+    "sight": {
+        "gleaming", "glowing", "shimmering", "sparkling", "twinkling", "flickering", "blazing",
+        "glinting", "luminous", "radiant", "brilliant", "vivid", "pale", "faded", "translucent"
+    }
+}
+
+# ------------------ extraction LLM prompt ------------------
+
+# Final optimized prompts
+SYSTEM = """You are a specialist in extracting PHYSICAL SENSORY EXPERIENCES from historical texts.
+
+EXTRACT ONLY these 5 types:
+1. SMELL: Scents/odors - "acrid smoke", "sweet incense", "putrid decay", "fragrant blossoms"
+2. SOUND: Audio qualities - "thunderous roar", "soft whisper", "piercing shriek", "distant chiming"  
+3. TASTE: Flavors in mouth - "bitter medicine", "sweet honey", "metallic blood", "salty tears"
+4. TOUCH: Physical sensations - "rough bark", "silky cloth", "burning heat", "icy wind"
+5. SIGHT: Visual qualities - "blazing fire", "dim shadows", "brilliant gold", "shimmering water"
+
+NEVER extract:
+❌ Emotions: "angry look", "confident air", "nervous glance"
+❌ Body parts: "eyes", "face", "hands", "mouth"  
+❌ Actions: "breathing", "heartbeat", "running", "walking"
+❌ Objects without qualities: "sword", "tea", "house", "door"
+
+QUALITY RULES:
+• Each term must describe HOW something affects the senses
+• Use specific sensory vocabulary (acrid, thunderous, silky, blazing, putrid)
+• 2-3 words maximum per term
+• Only extract 3-5 terms per passage (be highly selective)
+
+Return: {"items":[{"term":"Acrid Smoke","category":"smell","notes":"brief context"}]}"""
+
+USER_TMPL = """Extract ONLY genuine sensory experiences that characters physically perceive through their 5 senses.
+
+SETTING: {locale}, {era} period, {register} context, {weather} conditions
+
+FOCUS ON:
+• What characters SMELL (scents, odors, aromas)
+• What they HEAR (sound qualities, not just "voice" or "sound")  
+• What they TASTE (actual flavors in mouth)
+• What they FEEL physically (textures, temperatures, pressures)
+• What they SEE (visual qualities, not just objects)
+
+PASSAGE:
+{passage}
+
+Extract 3-5 high-quality sensory terms with specific descriptive vocabulary."""
+
 
 # ---- config / globals ----
 MCP_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp").rstrip("/")
@@ -94,6 +405,256 @@ _MCP_SESSION_PARAM_NAMES = ("sessionId", "transportId")  # common names servers 
 _MCP_SESSION: Optional[requests.Session] = None
 _MCP_SESSION_ID: Optional[str] = None
 _MCP_INITIALIZED: bool = False
+
+
+# Function to get context-appropriate vocabulary
+def get_contextual_vocabulary(locale: str, era: str, register: str) -> Dict[str, List[str]]:
+    """Return vocabulary appropriate for specific historical context."""
+
+    # Base vocabulary from register
+    base_vocab = REGISTER_SPECIFIC_VOCABULARY.get(register, {})
+
+    # Era-specific modifications
+    era_focus = ERA_SPECIFIC_FOCUS.get(era, {})
+    priority_cats = era_focus.get("priority_categories", [])
+
+    # Enhance vocabulary for priority categories
+    enhanced_vocab = {}
+    for category, terms in base_vocab.items():
+        if category in priority_cats:
+            # Add more terms for priority categories
+            enhanced_vocab[category] = terms + [f"refined {term}" for term in terms[:3]]
+        else:
+            enhanced_vocab[category] = terms
+
+    return enhanced_vocab
+
+
+# Usage example function
+def demonstrate_contextual_extraction():
+    """Show how context affects sensory vocabulary selection."""
+
+    contexts = [
+        ("China", "Song", "court"),
+        ("Japan", "Heian", "court"),
+        ("China", "Song", "market"),
+        ("Andes", "Chimú", "maritime")
+    ]
+
+    for locale, era, register in contexts:
+        print(f"\n{locale} - {era} period - {register} setting:")
+        vocab = get_contextual_vocabulary(locale, era, register)
+        for category, terms in vocab.items():
+            print(f"  {category}: {', '.join(terms[:3])}")
+
+# Updated extraction function with stricter validation
+# STEP 2: Replace your extract_items function with this enhanced version
+def extract_items(chunk: str, ctx: Dict) -> List[Dict]:
+    """Enhanced extraction with Phase 1 + Phase 2 (context-aware) validation."""
+    logger = logging.getLogger("sense-ingest")
+
+    locale = ctx.get("locale", "")
+    era = ctx.get("era", "")
+    register = ctx.get("register", "common")
+
+    # Check if we have enough context for cultural enhancement
+    if locale and era and register != "common":
+        # Use Phase 2 context-aware extraction
+        logger.debug(f"Using context-aware extraction for {era} {locale} ({register})")
+        return extract_items_context_aware(chunk, ctx)
+    else:
+        # Fall back to Phase 1 extraction for incomplete context
+        logger.debug("Using standard extraction (insufficient cultural context)")
+        return extract_items_standard(chunk, ctx)
+
+
+# STEP 3: Rename your current extract_items to extract_items_standard
+def extract_items_standard(chunk: str, ctx: Dict) -> List[Dict]:
+    """Phase 1 extraction with basic validation."""
+    logger = logging.getLogger("sense-ingest")
+
+    # Get LLM response using optimized prompts
+    obj = chat_json(SYSTEM, USER_TMPL.format(
+        locale=ctx.get("locale", ""), era=ctx.get("era", ""),
+        register=ctx.get("register", ""), weather=ctx.get("weather", ""),
+        passage=chunk
+    ))
+
+    items = obj.get("items", []) if isinstance(obj, dict) else []
+    requirements = get_category_requirements()
+
+    validated = []
+    rejection_reasons = []
+
+    for item in items:
+        term = (item.get("term", "") or "").strip()
+        category = (item.get("category", "") or "").strip().lower()
+        notes = (item.get("notes", "") or "").strip()
+
+        # Basic validation
+        if not term or category not in ALLOWED_CATS:
+            continue
+
+        term_lower = term.lower()
+
+        # Apply Phase 1 filters
+        if any(banned in term_lower for banned in BAN_TERMS):
+            rejection_reasons.append(f"'{term}': banned term")
+            continue
+
+        # Emotion/abstract check
+        banned_indicators = [
+            "annoyed", "angry", "furious", "confident", "nervous", "sad", "happy",
+            "glance", "look", "stare", "air", "expression", "manner"
+        ]
+        if any(banned in term_lower for banned in banned_indicators):
+            rejection_reasons.append(f"'{term}': emotion/abstract concept")
+            continue
+
+        # Physiological check
+        physio_terms = ["breath", "heartbeat", "pulse", "circulation"]
+        if any(physio in term_lower for physio in physio_terms):
+            rejection_reasons.append(f"'{term}': physiological rather than sensory")
+            continue
+
+        # Category-specific validation
+        cat_req = requirements[category]
+        has_required = (
+                any(word in term_lower for word in cat_req["required_words"]) or
+                any(concept in term_lower for concept in cat_req["required_concepts"])
+        )
+        if not has_required:
+            rejection_reasons.append(f"'{term}': {cat_req['description']}")
+            continue
+
+        # Length check
+        if len(term) < MIN_TERM_CHARS:
+            rejection_reasons.append(f"'{term}': too short")
+            continue
+
+        # All validation passed
+        validated.append({
+            "term": term.title(),
+            "category": category,
+            "notes": notes
+        })
+
+    # Logging
+    logger.info(f"Standard extraction validated {len(validated)}/{len(items)} terms")
+    if validated:
+        logger.info(f"Valid terms: {', '.join(item['term'] for item in validated[:3])}")
+    if rejection_reasons and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"Standard filtering: {'; '.join(rejection_reasons[:3])}")
+
+    return validated
+
+# STEP 4: Add cultural analysis to your reporting
+def analyze_cultural_authenticity(extracted_items: List[Dict], locale: str, era: str, register: str) -> Dict:
+    """Analyze the cultural authenticity of extracted terms."""
+    if not extracted_items:
+        return {"cultural_score": 0, "analysis": "No items to analyze"}
+
+    total_score = 0
+    authentic_terms = []
+
+    for item in extracted_items:
+        term = item.get("term", "")
+        category = item.get("category", "")
+
+        score = score_cultural_authenticity(term, category, locale, era, register)
+        total_score += score
+
+        if score >= 7:  # High cultural authenticity
+            authentic_terms.append(term)
+
+    avg_score = total_score / len(extracted_items)
+
+    return {
+        "cultural_score": round(avg_score, 1),
+        "highly_authentic_terms": authentic_terms,
+        "authenticity_percentage": round(len(authentic_terms) / len(extracted_items) * 100, 1),
+        "analysis": f"Cultural authenticity for {era} {locale} ({register})"
+    }
+
+
+# STEP 5: Enhanced logging function
+def log_cultural_extraction_summary(items: List[Dict], locale: str, era: str, register: str):
+    """Log a summary of cultural extraction results."""
+    logger = logging.getLogger("sense-ingest")
+
+    if not items:
+        return
+
+    # Analyze cultural authenticity
+    analysis = analyze_cultural_authenticity(items, locale, era, register)
+
+    logger.info(f"Cultural Analysis: {analysis['cultural_score']}/10 authenticity score")
+
+    if analysis['highly_authentic_terms']:
+        logger.info(f"Highly authentic terms: {', '.join(analysis['highly_authentic_terms'][:3])}")
+
+    # Log era-specific insights
+    era_info = ERA_SPECIFIC_FOCUS.get(era, {})
+    if era_info.get('cultural_emphasis'):
+        logger.debug(f"{era} cultural focus: {', '.join(era_info['cultural_emphasis'])}")
+
+
+# In your ingest_pdf function, after the page processing loop, add:
+def enhance_ingest_with_cultural_analysis(all_items, defaults, logger):
+    """Add cultural analysis to the ingestion process."""
+    locale = defaults.get("locale", "")
+    era = defaults.get("era", "")
+    register = defaults.get("register", "common")
+
+    if locale and era:
+        # Log cultural analysis
+        log_cultural_extraction_summary(all_items, locale, era, register)
+
+        # Get era-specific statistics
+        era_info = ERA_SPECIFIC_FOCUS.get(era, {})
+        priority_cats = era_info.get("priority_categories", [])
+
+        if priority_cats:
+            # Count terms in priority categories
+            category_map = {"smell": "scent", "sound": "audio", "taste": "flavor",
+                            "touch": "texture", "sight": "luminosity"}
+
+            priority_count = 0
+            for item in all_items:
+                cat = item.get("category", "")
+                hist_cat = category_map.get(cat, cat)
+                if hist_cat in priority_cats:
+                    priority_count += 1
+
+            if priority_count > 0:
+                logger.info(f"{era} era focus: {priority_count}/{len(all_items)} terms in priority categories")
+
+# Quality scoring function
+def score_sensory_term(term: str, category: str) -> int:
+    """Score a sensory term from 1-10 based on quality."""
+    score = 5  # Base score
+    term_lower = term.lower()
+    requirements = get_category_requirements()
+
+    # Bonus for specific sensory vocabulary
+    if any(word in term_lower for word in requirements[category]["required_words"]):
+        score += 2
+
+    # Bonus for compound descriptive terms
+    if len(term.split()) >= 2:
+        score += 1
+
+    # Penalty for vague terms
+    vague_words = ["thing", "stuff", "something", "general", "normal"]
+    if any(vague in term_lower for vague in vague_words):
+        score -= 2
+
+    # Bonus for historical/poetic language
+    elevated_words = ["blazing", "thunderous", "silken", "crystalline", "aromatic"]
+    if any(elevated in term_lower for elevated in elevated_words):
+        score += 1
+
+    return max(1, min(10, score))
 
 # ------------------ MCP call ------------------
 
@@ -762,33 +1323,97 @@ def apply_rules(text: str, rules: Dict) -> Dict:
     return inferred
 
 # ------------------ OpenAI-compatible call ------------------
+
+# Phase 2: Context-Aware Vocabulary Enhancement
+# Add these functions to your sense_ingest_docs.py
+
+def get_enhanced_prompts(locale: str, era: str, register: str) -> tuple[str, str]:
+    """Generate context-aware prompts based on historical setting."""
+
+    # Get contextual vocabulary
+    vocab = get_contextual_vocabulary(locale, era, register)
+    era_focus = ERA_SPECIFIC_FOCUS.get(era, {})
+    cultural_emphasis = era_focus.get("cultural_emphasis", [])
+
+    # Build context-specific examples
+    context_examples = []
+    if register in REGISTER_SPECIFIC_VOCABULARY:
+        reg_vocab = REGISTER_SPECIFIC_VOCABULARY[register]
+        for category, terms in reg_vocab.items():
+            if terms and category in ["scent", "audio", "flavor", "texture", "luminosity"]:
+                # Map to our 5 categories
+                cat_map = {"scent": "smell", "audio": "sound", "flavor": "taste",
+                           "texture": "touch", "luminosity": "sight"}
+                mapped_cat = cat_map.get(category, category)
+                if mapped_cat in ["smell", "sound", "taste", "touch", "sight"]:
+                    context_examples.append(f"{mapped_cat.upper()}: \"{terms[0]}\"")
+
+    # Enhanced system prompt with cultural context
+    enhanced_system = f"""You are a specialist in extracting PHYSICAL SENSORY EXPERIENCES from historical texts set in {locale} during the {era} period.
+
+HISTORICAL CONTEXT: {locale}, {era} era, {register} setting
+CULTURAL FOCUS: {', '.join(cultural_emphasis) if cultural_emphasis else 'authentic historical sensory experiences'}
+
+EXTRACT ONLY these 5 types with period-appropriate vocabulary:
+1. SMELL: Scents/odors - "aromatic incense", "smoky braziers", "fragrant oils"
+2. SOUND: Audio qualities - "ceremonial bells", "distant chiming", "rustling silk"  
+3. TASTE: Flavors in mouth - "bitter tea", "sweet wine", "herbal remedies"
+4. TOUCH: Physical sensations - "silk brocade", "rough hemp", "smooth jade"
+5. SIGHT: Visual qualities - "golden glow", "flickering lanterns", "brilliant bronze"
+
+{f"PREFERRED VOCABULARY FOR THIS SETTING: {', '.join(context_examples[:3])}" if context_examples else ""}
+
+NEVER extract:
+❌ Emotions: "angry look", "confident air", "nervous glance"
+❌ Body parts: "eyes", "face", "hands", "mouth"  
+❌ Actions: "breathing", "heartbeat", "running", "walking"
+❌ Objects without qualities: "sword", "tea", "house", "door"
+
+QUALITY RULES:
+• Each term must describe HOW something affects the senses
+• Use vocabulary appropriate to {era} period {locale}
+• Prefer terms authentic to {register} settings
+• 2-3 words maximum per term
+• Only extract 3-5 terms per passage (be highly selective)
+
+Return: {{"items":[{{"term":"Aromatic Incense","category":"smell","notes":"brief context"}}]}}"""
+
+    # Enhanced user template with cultural guidance
+    enhanced_user = f"""Extract ONLY genuine sensory experiences from this {era} period text set in {locale}.
+
+HISTORICAL SETTING: {locale}, {era} period, {register} context
+CULTURAL GUIDANCE: Focus on sensory experiences authentic to this time and place.
+
+PRIORITIZE THESE SENSORY AREAS for {era} culture:
+{f"• {', '.join(era_focus.get('priority_categories', []))}" if era_focus.get('priority_categories') else "• All sensory categories equally"}
+
+FOCUS ON:
+• What characters SMELL (incense, cooking, nature, architectural scents)
+• What they HEAR (ceremonial sounds, natural acoustics, period-specific audio)  
+• What they TASTE (period foods, drinks, medicines)
+• What they FEEL physically (period textiles, materials, temperatures)
+• What they SEE (period lighting, colors, architectural elements)
+
+PASSAGE:
+{{passage}}
+
+Extract 3-5 high-quality sensory terms authentic to {era} period {locale}."""
+
+    return enhanced_system, enhanced_user
+
+
+# Replace your chat_json function with this more robust version:
+
 def chat_json(system: str, user: str, model: str = MODEL_ID, temperature: float = 0.2) -> Dict:
     """
-    Creates and sends a chat completion request to the OpenAI API and processes
-    the JSON response. The function utilizes the specified model, system message,
-    user input, and optional temperature for generating responses.
-
-    :param system: The system message defining the context or behavior of the
-                   model.
-    :type system: str
-    :param user: The user input or message to which the model responds.
-    :type user: str
-    :param model: The identifier of the model to use. Defaults to MODEL_ID.
-    :type model: str
-    :param temperature: The sampling temperature. Controls the variability of
-                        the model's responses. A lower value results in more
-                        deterministic output. Defaults to 0.2.
-    :type temperature: float
-    :return: Parsed JSON object from the model's top choice containing
-             the generated message.
-    :rtype: Dict
+    Creates and sends a chat completion request with robust JSON parsing.
     """
     logger = logging.getLogger("sense-ingest")
     url = f"{OPENAI_API_BASE.rstrip('/')}/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
         "model": model,
-        "messages": [{"role":"system","content": system},{"role":"user","content": user}],
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "response_format": {"type": "json_object"},
         "temperature": temperature,
     }
@@ -801,73 +1426,59 @@ def chat_json(system: str, user: str, model: str = MODEL_ID, temperature: float 
     logger.info("LLM call %.2fs", dt)
     r.raise_for_status()
     content = r.json()["choices"][0]["message"]["content"]
-    m = re.search(r"\{.*}", content, flags=re.S)
-    if m: content = m.group(0)
-    return json.loads(content)
 
-def extract_items(chunk: str, ctx: Dict) -> List[Dict]:
-    """
-    Extracts sensory-related items from a given text chunk using a provided context.
+    # More robust JSON extraction and parsing
+    try:
+        # First try: parse as-is
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Second try: extract JSON from markdown code blocks
+        json_match = re.search(r'```(?:json)?\s*(\{.*?})\s*```', content, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
 
-    This function processes a text chunk and extracts structured information
-    about terms that fall into specific sensory categories. It utilizes a context
-    for customizing the behavior of the extraction process. The extracted items
-    are then filtered and cleaned for relevancy before being returned.
+        # Third try: find the first complete JSON object
+        json_match = re.search(r'\{.*}', content, flags=re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                pass
 
-    :param chunk: The input text content to process.
-    :param ctx: A dictionary containing contextual parameters relevant for
-        extraction.
-    :return: A list of dictionaries, where each dictionary represents a sensory
-        term, its category, and associated notes.
-    """
-    logger = logging.getLogger("sense-ingest")
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("Extract with ctx: %s", {k: ctx.get(k) for k in ("locale","era","register","weather")})
-    if logging.getLogger("sense-ingest").isEnabledFor(logging.DEBUG):
-        logger.debug("Chunk preview: %s", (chunk[:160] + "…") if len(chunk) > 160 else chunk)
-    obj = chat_json(SYSTEM, USER_TMPL.format(
-        locale=ctx.get("locale",""), era=ctx.get("era",""),
-        register=ctx.get("register",""), weather=ctx.get("weather",""),
-        passage=chunk
-    ))
-    items = obj.get("items", []) if isinstance(obj, dict) else []
-    cleaned = []
-    for it in items:
-        term = (it.get("term","") or "").strip()
-        cat  = (it.get("category","") or "").strip().lower()
-        notes= (it.get("notes","") or "").strip()
-        if term and cat in {"smell","sound","taste","touch","sight"}:
-            cleaned.append({"term": term, "category": cat, "notes": notes})
-    logger.info("Extracted %d items", len(cleaned))
-    return cleaned
+        # Fourth try: fix common JSON issues
+        try:
+            # Fix duplicate "items" keys by merging arrays
+            if '"items":' in content:
+                # Extract all items arrays
+                all_items = []
+                for match in re.finditer(r'"items":\s*(\[.*?])', content):
+                    try:
+                        items_array = json.loads(match.group(1))
+                        if isinstance(items_array, list):
+                            all_items.extend(items_array)
+                    except json.JSONDecodeError:
+                        continue
+
+                if all_items:
+                    return {"items": all_items}
+
+            # Remove trailing commas
+            fixed_content = re.sub(r',(\s*[}\]])', r'\1', content)
+            # Extract JSON object
+            json_match = re.search(r'\{.*}', fixed_content, flags=re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+        # Fifth try: return a safe fallback
+        logger.warning(f"Failed to parse JSON response: {content[:200]}...")
+        return {"items": []}  # Safe fallback - empty items list
 
 
-# ------------------ extraction LLM prompt ------------------
-SYSTEM = """You extract *explicit* sensory details from historical/literary passages.
-
-Return strict JSON: {"items":[
-  {"term": "...", "category": "smell|sound|taste|touch|sight", "notes": "..."}
-]}
-
-Rules:
-- Only include cues stated or strongly implied; do not invent.
-- "term" short + reusable; "notes" <= 12 words.
-- Use exactly one of: smell, sound, taste, touch, sight.
-- Avoid anachronisms; defer to provided CONTEXT if consistent with the text.
-- 0..12 items per chunk is fine.
-"""
-
-USER_TMPL = """Extract sensory items from the passage. Output JSON only.
-
-CONTEXT (may be incomplete):
-- Locale: {locale}
-- Era: {era}
-- Register: {register}
-- Weather/Time: {weather}
-
-PASSAGE:
-{passage}
-"""
 
 def _ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
@@ -897,6 +1508,193 @@ def _summarize_cats(d: Dict[str, int]) -> str:
         if k not in order:
             parts.append(f"{k}:{v}")
     return ", ".join(parts) if parts else "-"
+
+
+def validate_cultural_authenticity(term: str, category: str, locale: str, era: str, register: str) -> tuple[bool, str]:
+    """Validate if a term is culturally authentic for the historical context."""
+
+    term_lower = term.lower()
+
+    # Get cultural vocabulary for this context
+    vocab = get_contextual_vocabulary(locale, era, register)
+    era_info = ERA_SPECIFIC_FOCUS.get(era, {})
+
+    # Check if term aligns with cultural priorities
+    priority_categories = era_info.get("priority_categories", [])
+
+    # Map our categories to historical categories
+    category_map = {"smell": "scent", "sound": "audio", "taste": "flavor",
+                    "touch": "texture", "sight": "luminosity"}
+    hist_category = category_map.get(category, category)
+
+    # Bonus for terms in priority categories
+    is_priority = hist_category in priority_categories
+
+    # Check for anachronisms (terms that don't fit the period)
+    anachronisms = {
+        "electric", "plastic", "digital", "computer", "phone", "car", "airplane",
+        "gunpowder" if era in ["Heian"] else "",  # Gunpowder wasn't in Heian period
+        "tobacco" if era in ["Heian", "Song"] else "",  # Tobacco came later
+    }
+    anachronisms = {a for a in anachronisms if a}  # Remove empty strings
+
+    if any(ana in term_lower for ana in anachronisms):
+        return False, f"anachronistic for {era} period"
+
+    # Check for appropriate vocabulary
+    if hist_category in vocab:
+        category_vocab = vocab[hist_category]
+        has_appropriate_vocab = any(v in term_lower for v in category_vocab)
+        if has_appropriate_vocab:
+            return True, f"authentic {era} vocabulary"
+
+    # Allow terms with general sensory vocabulary
+    general_sensory = {
+        "smell": ["aromatic", "fragrant", "acrid", "sweet", "smoky", "musty"],
+        "sound": ["distant", "soft", "loud", "harsh", "melodic", "thunderous"],
+        "taste": ["bitter", "sweet", "sour", "salty", "savory", "rich"],
+        "touch": ["rough", "smooth", "soft", "hard", "warm", "cool"],
+        "sight": ["bright", "dim", "brilliant", "pale", "gleaming", "shimmering"]
+    }
+
+    has_sensory_vocab = any(word in term_lower for word in general_sensory.get(category, []))
+    if has_sensory_vocab:
+        return True, "general sensory vocabulary"
+
+    return True, "acceptable"  # Default to accepting if no issues found
+
+
+def extract_items_context_aware(chunk: str, ctx: Dict) -> List[Dict]:
+    """Context-aware extraction using cultural vocabulary and validation."""
+    logger = logging.getLogger("sense-ingest")
+
+    locale = ctx.get("locale", "")
+    era = ctx.get("era", "")
+    register = ctx.get("register", "common")
+
+    # Get enhanced prompts for this cultural context
+    system_prompt, user_prompt = get_enhanced_prompts(locale, era, register)
+
+    # Get LLM response using context-aware prompts
+    obj = chat_json(system_prompt, user_prompt.format(
+        locale=locale, era=era, register=register,
+        weather=ctx.get("weather", ""), passage=chunk
+    ))
+
+    items = obj.get("items", []) if isinstance(obj, dict) else []
+    requirements = get_category_requirements()
+
+    validated = []
+    rejection_reasons = []
+
+    for item in items:
+        term = (item.get("term", "") or "").strip()
+        category = (item.get("category", "") or "").strip().lower()
+        notes = (item.get("notes", "") or "").strip()
+
+        # Basic validation (from Phase 1)
+        if not term or category not in ALLOWED_CATS:
+            continue
+
+        term_lower = term.lower()
+
+        # Apply Phase 1 filters
+        if any(banned in term_lower for banned in BAN_TERMS):
+            rejection_reasons.append(f"'{term}': banned term")
+            continue
+
+        # Emotion/abstract check
+        banned_indicators = [
+            "annoyed", "angry", "furious", "confident", "nervous", "sad", "happy",
+            "glance", "look", "stare", "air", "expression", "manner"
+        ]
+        if any(banned in term_lower for banned in banned_indicators):
+            rejection_reasons.append(f"'{term}': emotion/abstract concept")
+            continue
+
+        # Physiological check
+        physio_terms = ["breath", "heartbeat", "pulse", "circulation"]
+        if any(physio in term_lower for physio in physio_terms):
+            rejection_reasons.append(f"'{term}': physiological rather than sensory")
+            continue
+
+        # Category-specific validation
+        cat_req = requirements[category]
+        has_required = (
+                any(word in term_lower for word in cat_req["required_words"]) or
+                any(concept in term_lower for concept in cat_req["required_concepts"])
+        )
+        if not has_required:
+            rejection_reasons.append(f"'{term}': {cat_req['description']}")
+            continue
+
+        # Length check
+        if len(term) < MIN_TERM_CHARS:
+            rejection_reasons.append(f"'{term}': too short")
+            continue
+
+        # NEW: Cultural authenticity validation
+        is_authentic, auth_reason = validate_cultural_authenticity(term, category, locale, era, register)
+        if not is_authentic:
+            rejection_reasons.append(f"'{term}': {auth_reason}")
+            continue
+
+        # All validation passed
+        validated.append({
+            "term": term.title(),
+            "category": category,
+            "notes": notes,
+            "cultural_authenticity": auth_reason  # Track why it was accepted
+        })
+
+    # Enhanced logging with cultural context
+    logger.info(f"Context-aware extraction for {era} {locale} ({register})")
+    logger.info(f"Validated {len(validated)}/{len(items)} culturally authentic terms")
+    if validated:
+        logger.info(f"Authentic terms: {', '.join(item['term'] for item in validated[:3])}")
+    if rejection_reasons and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"Cultural filtering: {'; '.join(rejection_reasons[:3])}")
+
+    # Remove the cultural_authenticity field before returning (it's just for logging)
+    for item in validated:
+        item.pop("cultural_authenticity", None)
+
+    return validated
+
+
+def score_cultural_authenticity(term: str, category: str, locale: str, era: str, register: str) -> int:
+    """Score term for cultural authenticity (1-10)."""
+    base_score = 5
+    term_lower = term.lower()
+
+    # Get cultural context
+    vocab = get_contextual_vocabulary(locale, era, register)
+    era_info = ERA_SPECIFIC_FOCUS.get(era, {})
+
+    # Bonus for era-appropriate vocabulary
+    category_map = {"smell": "scent", "sound": "audio", "taste": "flavor",
+                    "touch": "texture", "sight": "luminosity"}
+    hist_category = category_map.get(category, category)
+
+    if hist_category in vocab:
+        category_vocab = vocab[hist_category]
+        if any(v in term_lower for v in category_vocab):
+            base_score += 3  # Strong cultural alignment
+
+    # Bonus for priority categories of this era
+    priority_categories = era_info.get("priority_categories", [])
+    if hist_category in priority_categories:
+        base_score += 1
+
+    # Bonus for register-appropriate terms
+    if register in REGISTER_SPECIFIC_VOCABULARY:
+        reg_vocab = REGISTER_SPECIFIC_VOCABULARY[register]
+        if hist_category in reg_vocab:
+            reg_terms = reg_vocab[hist_category]
+            if any(rt in term_lower for rt in reg_terms):
+                base_score += 2
+
+    return max(1, min(10, base_score))
 
 def _render_report_md(stats: Dict, moved_to: list[str], final_dir: Optional[Path]) -> str:
     """
